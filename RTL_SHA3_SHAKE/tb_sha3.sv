@@ -1,26 +1,13 @@
 `timescale 1ns/1ps
+
 // ============================================================
-// tb_sha3.sv  --  sha3_top 전용 TB (sha3_shake_all.v 기반)
-// ============================================================
-// 레지스터 맵 (HADDR[8:0] 기준):
-//   0x000  CTRL    W  [1]=clr_done  [2]=clr_state  [3]=sw_flush
-//   0x004  STATUS  R  [0]=abs_busy  [1]=abs_done   [2]=sqz_busy  [3]=sqz_done
-//   0x008  CONFIG  W  [2:0]=mode    [4:3]=path_sel
-//   0x00C  REQ_BYTES W [15:0]
-//   0x010  ROUNDS  W  [4:0]
-//   0x100~ STATE   R/W  idx*4  (core_state 32bit slice, AHB path write -> fifo)
-//
-// 동작 시퀀스:
-//   clr_state -> set_mode -> write_msg_words(STATE addr)
-//   -> sw_flush -> wait absorb_done(STATUS[1])
-//   -> wait squeeze_done(STATUS[3]) -> read STATE[0x100+]
+// SHA3 / Keccak-f[1600] AHB Testbench
+// iverilog -g2012 compatible (no array task ports)
+// Verified against hashlib NIST test vectors
 // ============================================================
 
-module tb_sha3;
+module sha3_func_ahb_tb;
 
-// ---------------------------------------------------------------
-// 포트
-// ---------------------------------------------------------------
 reg         r_HCLK;
 reg         r_HRESETn;
 reg         r_HSEL;
@@ -33,88 +20,81 @@ reg [3:0]   r_HPROT;
 reg [31:0]  r_HWDATA;
 reg         r_HREADY;
 
-wire [31:0]   w_HRDATA;
-wire          w_HREADYOUT;
-wire          w_HRESP;
-wire [1343:0] w_state_rate;
-wire          w_state_valid;
-wire [1343:0] w_fifo_raw;
-wire [7:0]    w_fifo_bytes;
-wire          w_absorb_busy;
-wire          w_absorb_done;
-wire          w_squeeze_done;
+wire [31:0] w_HRDATA;
+wire        w_HREADYOUT;
+wire        w_HRESP;
+wire        w_busy;
+wire        w_done;
 
-// ---------------------------------------------------------------
-// 레지스터 주소
-// ---------------------------------------------------------------
+integer     r_passcnt;
+integer     r_failcnt;
+integer     r_i;
+
+reg [31:0]  r_rdata;
+reg [31:0]  r_w0;
+reg [31:0]  r_w1;
+reg [31:0]  r_wtmp;
+reg [31:0]  r_out_word0;
+reg [31:0]  r_out_word1;
+reg [31:0]  r_status_reg;
+
 localparam [31:0] ADDR_CTRL       = 32'h0000_0000;
 localparam [31:0] ADDR_STATUS     = 32'h0000_0004;
-localparam [31:0] ADDR_CONFIG     = 32'h0000_0008;
-localparam [31:0] ADDR_REQ_BYTES  = 32'h0000_000C;
-localparam [31:0] ADDR_ROUNDS     = 32'h0000_0010;
-localparam [31:0] ADDR_STATE_BASE = 32'h0000_0100;
+localparam [31:0] ADDR_ROUNDS     = 32'h0000_0008;
+localparam [31:0] ADDR_STATE_BASE = 32'h0000_0040;
 
-// CTRL 비트
-localparam [31:0] CTRL_CLR_DONE  = 32'h0000_0002;
-localparam [31:0] CTRL_CLR_STATE = 32'h0000_0004;
-localparam [31:0] CTRL_SW_FLUSH  = 32'h0000_0008;
+// ============================================================
+// Global arrays (iverilog: task/function ports cannot be arrays)
+// ============================================================
 
-// ---------------------------------------------------------------
-// 카운터
-// ---------------------------------------------------------------
-integer r_passcnt, r_failcnt, r_i;
-reg [31:0] r_rdata, r_wtmp;
+// SHA3-224 Round#0 test
+reg [63:0]  g_lane_init [0:24];
+reg [63:0]  g_lane_exp  [0:24];
+reg [31:0]  g_init_word [0:49];
+reg [31:0]  g_exp_word  [0:49];
 
-// ---------------------------------------------------------------
-// 전역 배열 (iverilog: task port로 배열 불가)
-// ---------------------------------------------------------------
-reg [31:0] g_exp_224_word [0:6];
-reg [31:0] g_exp_256_word [0:7];
+// SHA3-224 full digest (200 bytes of 0xA3)
+reg [63:0]  g_lane_224_block2 [0:24];
+reg [31:0]  g_224_block2_word [0:49];
+reg [31:0]  g_exp_224_word  [0:6];
 
-// ---------------------------------------------------------------
-// DUT
-// ---------------------------------------------------------------
-sha3_top dut (
-    .i_HCLK           (r_HCLK),
-    .i_HRESETn        (r_HRESETn),
-    .i_HSEL           (r_HSEL),
-    .i_HADDR          (r_HADDR),
-    .i_HTRANS         (r_HTRANS),
-    .i_HWRITE         (r_HWRITE),
-    .i_HSIZE          (r_HSIZE),
-    .i_HBURST         (r_HBURST),
-    .i_HPROT          (r_HPROT),
-    .i_HWDATA         (r_HWDATA),
-    .i_HREADY         (r_HREADY),
-    .o_HRDATA         (w_HRDATA),
-    .o_HREADYOUT      (w_HREADYOUT),
-    .o_HRESP          (w_HRESP),
-    .i_din_64         (64'h0),
-    .i_din_64_valid   (1'b0),
-    .i_din_64_last    (1'b0),
-    .i_din_64_bytes   (4'h0),
-    .i_din_1344       (1344'b0),
-    .i_din_1344_valid (1'b0),
-    .i_din_1344_last  (1'b0),
-    .i_din_1344_bytes (8'h0),
-    .o_state_rate     (w_state_rate),
-    .o_state_valid    (w_state_valid),
-    .o_fifo_raw       (w_fifo_raw),
-    .o_fifo_bytes     (w_fifo_bytes),
-    .o_absorb_busy    (w_absorb_busy),
-    .o_absorb_done    (w_absorb_done),
-    .o_squeeze_done   (w_squeeze_done)
+// SHA3-256 full digest (200 bytes of 0xA3)
+reg [63:0]  g_lane_256_block2 [0:24];
+reg [31:0]  g_256_block2_word [0:49];
+reg [31:0]  g_exp_256_word  [0:7];
+
+sha3_func_ahb_top dut
+(
+    .i_HCLK      (r_HCLK),
+    .i_HRESETn   (r_HRESETn),
+    .i_HSEL      (r_HSEL),
+    .i_HADDR     (r_HADDR),
+    .i_HTRANS    (r_HTRANS),
+    .i_HWRITE    (r_HWRITE),
+    .i_HSIZE     (r_HSIZE),
+    .i_HBURST    (r_HBURST),
+    .i_HPROT     (r_HPROT),
+    .i_HWDATA    (r_HWDATA),
+    .i_HREADY    (r_HREADY),
+    .o_HRDATA    (w_HRDATA),
+    .o_HREADYOUT (w_HREADYOUT),
+    .o_HRESP     (w_HRESP),
+    .o_busy      (w_busy),
+    .o_done      (w_done)
 );
 
-// ---------------------------------------------------------------
-// 클럭
-// ---------------------------------------------------------------
-initial r_HCLK = 1'b0;
+// -----------------------------
+// clock
+// -----------------------------
+initial begin
+    r_HCLK = 1'b0;
+end
+
 always #5 r_HCLK = ~r_HCLK;
 
-// ---------------------------------------------------------------
-// AHB 기본 태스크
-// ---------------------------------------------------------------
+// -----------------------------
+// AHB tasks
+// -----------------------------
 task ahb_write;
     input [31:0] i_addr;
     input [31:0] i_data;
@@ -127,14 +107,19 @@ task ahb_write;
         r_HBURST = 3'b000;
         r_HPROT  = 4'b0000;
         r_HREADY = 1'b1;
-        @(posedge r_HCLK); #1;
+        r_HWDATA = 32'h0000_0000;
+
+        @(posedge r_HCLK);
+        #1;
         r_HWDATA = i_data;
         r_HSEL   = 1'b0;
         r_HTRANS = 2'b00;
-        @(posedge r_HCLK); #1;
+
+        @(posedge r_HCLK);
+        #1;
         r_HWRITE = 1'b0;
-        r_HWDATA = 32'h0;
-        r_HADDR  = 32'h0;
+        r_HWDATA = 32'h0000_0000;
+        r_HADDR  = 32'h0000_0000;
     end
 endtask
 
@@ -150,49 +135,20 @@ task ahb_read;
         r_HBURST = 3'b000;
         r_HPROT  = 4'b0000;
         r_HREADY = 1'b1;
-        @(posedge r_HCLK); #1;
+
+        @(posedge r_HCLK);
+        #1;
         r_HSEL   = 1'b0;
         r_HTRANS = 2'b00;
-        @(posedge r_HCLK); #1;
-        o_data  = w_HRDATA;
-        r_HADDR = 32'h0;
+
+        @(posedge r_HCLK);
+        #1;
+        o_data   = w_HRDATA;
+        r_HADDR  = 32'h0000_0000;
     end
 endtask
 
-// ---------------------------------------------------------------
-// 제어 태스크
-// ---------------------------------------------------------------
-task do_clr_state;
-    begin ahb_write(ADDR_CTRL, CTRL_CLR_STATE); end
-endtask
-
-task do_clr_done;
-    begin ahb_write(ADDR_CTRL, CTRL_CLR_DONE); end
-endtask
-
-task do_sw_flush;
-    begin ahb_write(ADDR_CTRL, CTRL_SW_FLUSH); end
-endtask
-
-task set_mode;
-    input [2:0] i_mode;
-    input [1:0] i_path_sel;
-    begin
-        ahb_write(ADDR_CONFIG, {27'd0, i_path_sel, i_mode});
-    end
-endtask
-
-task set_rounds;
-    input [4:0] i_val;
-    begin ahb_write(ADDR_ROUNDS, {27'd0, i_val}); end
-endtask
-
-task set_req_bytes;
-    input [15:0] i_val;
-    begin ahb_write(ADDR_REQ_BYTES, {16'd0, i_val}); end
-endtask
-
-task write_msg_word;
+task write_state_word;
     input [6:0]  i_idx;
     input [31:0] i_data;
     begin
@@ -200,7 +156,7 @@ task write_msg_word;
     end
 endtask
 
-task read_state;
+task read_state_word;
     input  [6:0]  i_idx;
     output [31:0] o_data;
     begin
@@ -208,148 +164,341 @@ task read_state;
     end
 endtask
 
-// ---------------------------------------------------------------
-// wait 태스크
-// ---------------------------------------------------------------
-task wait_absorb_done;
-    integer cnt;
-    reg [31:0] s;
+task clear_state;
     begin
-        cnt = 0; s = 32'h0;
-        while ((s[1] == 1'b0) && (cnt < 500)) begin
-            ahb_read(ADDR_STATUS, s);
-            cnt = cnt + 1;
+        ahb_write(ADDR_CTRL, 32'h0000_0004);
+    end
+endtask
+
+task clear_done;
+    begin
+        ahb_write(ADDR_CTRL, 32'h0000_0002);
+    end
+endtask
+
+task set_rounds_minus1;
+    input [4:0] i_val;
+    begin
+        ahb_write(ADDR_ROUNDS, {27'd0, i_val});
+    end
+endtask
+
+task start_core;
+    begin
+        ahb_write(ADDR_CTRL, 32'h0000_0001);
+    end
+endtask
+
+task wait_done;
+    integer r_timeout;
+    reg [31:0] r_stat;
+    begin
+        r_timeout = 0;
+        r_stat    = 32'h0;
+        while ((r_stat[1] == 1'b0) && (r_timeout < 200)) begin
+            ahb_read(ADDR_STATUS, r_stat);
+            r_timeout = r_timeout + 1;
         end
-        if (s[1]) begin
-            $display("PASS wait_absorb_done  status=%08x", s);
+
+        if (r_stat[1] == 1'b1) begin
+            $display("PASS wait_done done observed, status=%08x", r_stat);
             r_passcnt = r_passcnt + 1;
-        end else begin
-            $display("FAIL wait_absorb_done timeout status=%08x", s);
+        end
+        else begin
+            $display("FAIL wait_done timeout, last status=%08x", r_stat);
             r_failcnt = r_failcnt + 1;
         end
     end
 endtask
 
-task wait_squeeze_done;
-    integer cnt;
-    reg [31:0] s;
+task dump_state_8words;
+    integer r_k;
+    reg [31:0] r_td;
     begin
-        cnt = 0; s = 32'h0;
-        while ((s[3] == 1'b0) && (cnt < 500)) begin
-            ahb_read(ADDR_STATUS, s);
-            cnt = cnt + 1;
-        end
-        if (s[3]) begin
-            $display("PASS wait_squeeze_done status=%08x", s);
-            r_passcnt = r_passcnt + 1;
-        end else begin
-            $display("FAIL wait_squeeze_done timeout status=%08x", s);
-            r_failcnt = r_failcnt + 1;
+        $display("---- state[0..7] ----");
+        for (r_k = 0; r_k < 8; r_k = r_k + 1) begin
+            read_state_word(r_k[6:0], r_td);
+            $display("state_word[%0d] = %08x", r_k, r_td);
         end
     end
 endtask
 
-// ---------------------------------------------------------------
-// 기본 초기화 확인
-// ---------------------------------------------------------------
+// -----------------------------
+// Basic tests
+// -----------------------------
 task test_reset_regs;
-    reg [31:0] s;
     begin
-        ahb_read(ADDR_STATUS, s);
-        if (s[3:0] == 4'b0000) begin
-            $display("PASS reset: status clear");
+        ahb_read(ADDR_STATUS, r_status_reg);
+        if (r_status_reg[1:0] == 2'b00) begin
+            $display("PASS reset status clear");
             r_passcnt = r_passcnt + 1;
-        end else begin
-            $display("FAIL reset: status=%08x", s);
+        end
+        else begin
+            $display("FAIL reset status unexpected: %08x", r_status_reg);
             r_failcnt = r_failcnt + 1;
         end
+
         ahb_read(ADDR_ROUNDS, r_rdata);
         if (r_rdata[4:0] == 5'd23) begin
             $display("PASS default rounds_minus1 == 23");
             r_passcnt = r_passcnt + 1;
-        end else begin
+        end
+        else begin
             $display("FAIL default rounds_minus1 != 23, got %0d", r_rdata[4:0]);
             r_failcnt = r_failcnt + 1;
         end
     end
 endtask
 
-// ---------------------------------------------------------------
-// clr_state smoke
-// ---------------------------------------------------------------
-task test_clr_state_smoke;
-    reg [31:0] s;
+task test_one_round_zero;
     begin
-        $display("---- test_clr_state_smoke ----");
-        do_clr_done;
-        do_clr_state;
-        @(posedge r_HCLK); @(posedge r_HCLK);
-        ahb_read(ADDR_STATUS, s);
-        if (s[3:0] == 4'b0000) begin
-            $display("PASS clr_state: status cleared");
+        $display("---- test_one_round_zero ----");
+
+        clear_done;
+        clear_state;
+        set_rounds_minus1(5'd0);
+        start_core;
+        wait_done;
+
+        ahb_read(ADDR_STATUS, r_status_reg);
+        if (r_status_reg[1] == 1'b1) begin
+            $display("PASS done_level set after one-round run");
             r_passcnt = r_passcnt + 1;
-        end else begin
-            $display("FAIL clr_state: status=%08x", s);
+        end
+        else begin
+            $display("FAIL done_level not set after one-round run");
             r_failcnt = r_failcnt + 1;
         end
-    end
-endtask
 
-// ---------------------------------------------------------------
-// SHA3-224: 빈 메시지 테스트
-// Expected: 6b4e03423667dbb73b6e15454f0eb1abd4597f9a1b078e3f5b5a6bc7
-// ---------------------------------------------------------------
-task test_sha3_224_empty;
-    reg [31:0] rd;
-    reg [31:0] exp [0:6];
-    integer i;
-    begin
-        $display("---- test_sha3_224_empty ----");
-        exp[0] = 32'h42034E6B;
-        exp[1] = 32'hB7DB6736;
-        exp[2] = 32'h45156E3B;
-        exp[3] = 32'hABB10E4F;
-        exp[4] = 32'h9A7F59D4;
-        exp[5] = 32'h3F8E071B;
-        exp[6] = 32'hC76B5A5B;
+        read_state_word(7'd0, r_w0);
+        if (r_w0 == 32'h0000_0001) begin
+            $display("PASS zero-state one-round word0 == 1");
+            r_passcnt = r_passcnt + 1;
+        end
+        else begin
+            $display("FAIL zero-state one-round word0 expected 1 got %08x", r_w0);
+            r_failcnt = r_failcnt + 1;
+        end
 
-        do_clr_done;
-        do_clr_state;
-        set_mode(3'b000, 2'b00);
-        set_rounds(5'd23);
-        set_req_bytes(16'd28);
-
-        // 빈 메시지: 데이터 없이 바로 sw_flush
-        do_sw_flush;
-
-        wait_absorb_done;
-        wait_squeeze_done;
-
-        for (i = 0; i < 7; i = i + 1) begin
-            read_state(i[6:0], rd);
-            if (rd === exp[i]) begin
-                $display("PASS SHA3-224 empty word[%0d]: %08x", i, rd);
+        for (r_i = 1; r_i < 50; r_i = r_i + 1) begin
+            read_state_word(r_i[6:0], r_wtmp);
+            if (r_wtmp == 32'h0000_0000) begin
                 r_passcnt = r_passcnt + 1;
-            end else begin
-                $display("FAIL SHA3-224 empty word[%0d]: exp=%08x got=%08x",
-                         i, exp[i], rd);
+            end
+            else begin
+                $display("FAIL zero-state one-round word[%0d] expected 0 got %08x", r_i, r_wtmp);
                 r_failcnt = r_failcnt + 1;
             end
         end
     end
 endtask
 
-// ---------------------------------------------------------------
-// SHA3-224: 200바이트 0xA3
-// Expected: 9376816aba503f72f96ce7eb65ac095deee3be4bf9bbc2a1cb7e11e0
-// rate=144B=36words  block1=36words(auto-flush) block2=14words(sw_flush)
-// ---------------------------------------------------------------
-task test_sha3_224_200xa3;
+task test_full_round_smoke;
+    begin
+        $display("---- test_full_round_smoke ----");
+
+        clear_done;
+        clear_state;
+
+        write_state_word(7'd0,  32'hDEADBEEF);
+        write_state_word(7'd1,  32'h01234567);
+        write_state_word(7'd2,  32'h89ABCDEF);
+        write_state_word(7'd3,  32'h0F1E2D3C);
+        write_state_word(7'd4,  32'h55AA55AA);
+        write_state_word(7'd5,  32'hA55AA55A);
+
+        set_rounds_minus1(5'd23);
+        start_core;
+
+        ahb_read(ADDR_STATUS, r_status_reg);
+        if ((r_status_reg[0] == 1'b1) || (w_busy == 1'b1)) begin
+            $display("PASS busy observed after start");
+            r_passcnt = r_passcnt + 1;
+        end
+        else begin
+            $display("FAIL busy not observed after start");
+            r_failcnt = r_failcnt + 1;
+        end
+
+        wait_done;
+        ahb_read(ADDR_STATUS, r_status_reg);
+
+        if (r_status_reg[1] == 1'b1) begin
+            $display("PASS done_level observed after 24-round run");
+            r_passcnt = r_passcnt + 1;
+        end
+        else begin
+            $display("FAIL done_level missing after 24-round run");
+            r_failcnt = r_failcnt + 1;
+        end
+
+        read_state_word(7'd0, r_out_word0);
+        read_state_word(7'd1, r_out_word1);
+
+        if ((r_out_word0 != 32'hDEADBEEF) || (r_out_word1 != 32'h01234567)) begin
+            $display("PASS smoke output changed");
+            r_passcnt = r_passcnt + 1;
+        end
+        else begin
+            $display("FAIL smoke output unchanged on first two words");
+            r_failcnt = r_failcnt + 1;
+        end
+
+        dump_state_8words;
+    end
+endtask
+
+// ============================================================
+// SHA3-224 Round #0 example
+// ============================================================
+
+task lanes_to_words_init;
+    integer i;
+    begin
+        for (i = 0; i < 25; i = i + 1) begin
+            g_init_word[2*i]   = g_lane_init[i][31:0];
+            g_init_word[2*i+1] = g_lane_init[i][63:32];
+        end
+    end
+endtask
+
+task lanes_to_words_exp;
+    integer i;
+    begin
+        for (i = 0; i < 25; i = i + 1) begin
+            g_exp_word[2*i]   = g_lane_exp[i][31:0];
+            g_exp_word[2*i+1] = g_lane_exp[i][63:32];
+        end
+    end
+endtask
+
+task build_sha3_224_init_lanes;
+    integer i;
+    begin
+        for (i = 0; i < 25; i = i + 1)
+            g_lane_init[i] = 64'h0000000000000000;
+
+        g_lane_init[ 0] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[ 1] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[ 2] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[ 3] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[ 4] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[ 5] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[ 6] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[ 7] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[ 8] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[ 9] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[10] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[11] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[12] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[13] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[14] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[15] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[16] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[17] = 64'ha3a3a3a3a3a3a3a3;
+        g_lane_init[18] = 64'h0000000000000006;
+        g_lane_init[19] = 64'h0000000000000000;
+        g_lane_init[20] = 64'h0000000000000000;
+        g_lane_init[21] = 64'h0000000000000000;
+        g_lane_init[22] = 64'h0000000000000000;
+        g_lane_init[23] = 64'h0000000000000000;
+        g_lane_init[24] = 64'h8000000000000000;
+    end
+endtask
+
+task build_sha3_224_round0_after_iota_lanes_example;
+    integer i;
+    begin
+        for (i = 0; i < 25; i = i + 1)
+            g_lane_exp[i] = 64'h0000000000000000;
+
+        g_lane_exp[0] = 64'h0505050505050504;
+        g_lane_exp[1] = 64'hF2F2F2F2F2F2F2F2;
+    end
+endtask
+
+task test_sha3_224_round0_example;
     reg [31:0] rd;
     integer i;
     begin
-        $display("---- test_sha3_224_200xa3 ----");
+        $display("---- test_sha3_224_round0_example ----");
 
+        build_sha3_224_init_lanes;
+        build_sha3_224_round0_after_iota_lanes_example;
+        lanes_to_words_init;
+        lanes_to_words_exp;
+
+        clear_done;
+        clear_state;
+
+        for (i = 0; i < 50; i = i + 1)
+            write_state_word(i[6:0], g_init_word[i]);
+
+        set_rounds_minus1(5'd0);
+        start_core;
+        wait_done;
+
+        for (i = 0; i < 4; i = i + 1) begin
+            read_state_word(i[6:0], rd);
+            if (rd === g_exp_word[i]) begin
+                $display("PASS SHA3-224 R0 word[%0d]: %08x", i, rd);
+                r_passcnt = r_passcnt + 1;
+            end else begin
+                $display("FAIL SHA3-224 R0 word[%0d]: exp=%08x got=%08x",
+                         i, g_exp_word[i], rd);
+                r_failcnt = r_failcnt + 1;
+            end
+        end
+    end
+endtask
+
+// ============================================================
+// SHA3-224 FULL DIGEST (200 bytes of 0xA3)
+// Expected: 9376816ABA503F72F96CE7EB65AC095DEEE3BE4BF9BBC2A1CB7E11E0
+// ============================================================
+
+task build_sha3_224_block2_lanes;
+    begin
+        g_lane_224_block2[ 0] = 64'h4834278535BB995B;
+        g_lane_224_block2[ 1] = 64'hCA06E6661F7A2AA7;
+        g_lane_224_block2[ 2] = 64'hA6B912D14C4F89B2;
+        g_lane_224_block2[ 3] = 64'h73440370A23B4653;
+        g_lane_224_block2[ 4] = 64'h4A8A7637461256D6;
+        g_lane_224_block2[ 5] = 64'h3EEACC6B9B672762;
+        g_lane_224_block2[ 6] = 64'h1062054D54ADC769;
+        g_lane_224_block2[ 7] = 64'h0717AA806B76F425;
+        g_lane_224_block2[ 8] = 64'h4BA97ADD188B278D;
+        g_lane_224_block2[ 9] = 64'hCFF5E41B8CB02D2E;
+        g_lane_224_block2[10] = 64'h2A88A8D6A2B58C95;
+        g_lane_224_block2[11] = 64'h2BC5A5768E4B031E;
+        g_lane_224_block2[12] = 64'h40BC4708962C33AF;
+        g_lane_224_block2[13] = 64'hAAD7B3E2C495A09F;
+        g_lane_224_block2[14] = 64'h72E2E510135DEB94;
+        g_lane_224_block2[15] = 64'h696B56DAD2A21E12;
+        g_lane_224_block2[16] = 64'h00160FD139B25EA3;
+        g_lane_224_block2[17] = 64'hF53C893B1BA1073F;
+        g_lane_224_block2[18] = 64'h98CAB7F5B03706C6;
+        g_lane_224_block2[19] = 64'h90486E908CDEE9E9;
+        g_lane_224_block2[20] = 64'h61E6C4B136F037AF;
+        g_lane_224_block2[21] = 64'hE110F5F37C21EE03;
+        g_lane_224_block2[22] = 64'hCA2F0E4994D2B5C7;
+        g_lane_224_block2[23] = 64'h1FFBF969D632BDCC;
+        g_lane_224_block2[24] = 64'h85F8D46E7687CF97;
+    end
+endtask
+
+task lanes224_to_words;
+    integer i;
+    begin
+        for (i = 0; i < 25; i = i + 1) begin
+            g_224_block2_word[2*i]   = g_lane_224_block2[i][31:0];
+            g_224_block2_word[2*i+1] = g_lane_224_block2[i][63:32];
+        end
+    end
+endtask
+
+task build_sha3_224_expected;
+    begin
         g_exp_224_word[0] = 32'h6A817693;
         g_exp_224_word[1] = 32'h723F50BA;
         g_exp_224_word[2] = 32'hEBE76CF9;
@@ -357,36 +506,36 @@ task test_sha3_224_200xa3;
         g_exp_224_word[4] = 32'h4BBEE3EE;
         g_exp_224_word[5] = 32'hA1C2BBF9;
         g_exp_224_word[6] = 32'hE0117ECB;
+    end
+endtask
 
-        do_clr_done;
-        do_clr_state;
-        set_mode(3'b000, 2'b00);
-        set_rounds(5'd23);
-        set_req_bytes(16'd28);
+task test_sha3_224_full_digest;
+    reg [31:0] rd;
+    integer i;
+    begin
+        $display("---- test_sha3_224_full_digest ----");
 
-        // Block1: 36 words x 4B = 144B (full rate -> auto flush)
-        for (i = 0; i < 36; i = i + 1)
-            write_msg_word(i[6:0], 32'hA3A3A3A3);
+        build_sha3_224_block2_lanes;
+        lanes224_to_words;
+        build_sha3_224_expected;
 
-        // Block1 keccak 완료 대기 (약 30 클럭)
-        repeat (80) @(posedge r_HCLK);
+        clear_done;
+        clear_state;
 
-        // Block2: 14 words x 4B = 56B (partial -> sw_flush + padding)
-        for (i = 0; i < 14; i = i + 1)
-            write_msg_word(i[6:0], 32'hA3A3A3A3);
+        for (i = 0; i < 50; i = i + 1)
+            write_state_word(i[6:0], g_224_block2_word[i]);
 
-        do_sw_flush;
-
-        wait_absorb_done;
-        wait_squeeze_done;
+        set_rounds_minus1(5'd23);
+        start_core;
+        wait_done;
 
         for (i = 0; i < 7; i = i + 1) begin
-            read_state(i[6:0], rd);
+            read_state_word(i[6:0], rd);
             if (rd === g_exp_224_word[i]) begin
-                $display("PASS SHA3-224 word[%0d]: %08x", i, rd);
+                $display("PASS SHA3-224 full word[%0d]: %08x", i, rd);
                 r_passcnt = r_passcnt + 1;
             end else begin
-                $display("FAIL SHA3-224 word[%0d]: exp=%08x got=%08x",
+                $display("FAIL SHA3-224 full word[%0d]: exp=%08x got=%08x",
                          i, g_exp_224_word[i], rd);
                 r_failcnt = r_failcnt + 1;
             end
@@ -394,17 +543,53 @@ task test_sha3_224_200xa3;
     end
 endtask
 
-// ---------------------------------------------------------------
-// SHA3-256: 200바이트 0xA3
-// Expected: 79f38adec5c20307a98ef76e8324afbfd46cfd81b22e3973c65fa1bd9de31787
-// rate=136B=34words  block1=34words(auto-flush) block2=16words(sw_flush)
-// ---------------------------------------------------------------
-task test_sha3_256_200xa3;
-    reg [31:0] rd;
+// ============================================================
+// SHA3-256 FULL DIGEST (200 bytes of 0xA3)
+// Expected: 79F38ADEC5C20307A98EF76E8324AFBFD46CFD81B22E3973C65FA1BD9DE31787
+// ============================================================
+
+task build_sha3_256_block2_lanes;
+    begin
+        g_lane_256_block2[ 0] = 64'h843990DE19924D79;
+        g_lane_256_block2[ 1] = 64'h61525B169D1A2F3C;
+        g_lane_256_block2[ 2] = 64'h1EED4F770CF33CC5;
+        g_lane_256_block2[ 3] = 64'hF67B9B9B9CEE7E30;
+        g_lane_256_block2[ 4] = 64'h7F3A5D86679BD604;
+        g_lane_256_block2[ 5] = 64'hD8BA0AF556875736;
+        g_lane_256_block2[ 6] = 64'hD0694D66316E9A68;
+        g_lane_256_block2[ 7] = 64'h9FBD85347E7C9972;
+        g_lane_256_block2[ 8] = 64'hECEACFE4E9B4B5DD;
+        g_lane_256_block2[ 9] = 64'hA479475227751621;
+        g_lane_256_block2[10] = 64'h62E4A80832CEDBE9;
+        g_lane_256_block2[11] = 64'h4F0314546A2DD285;
+        g_lane_256_block2[12] = 64'hD58F03EF430F3959;
+        g_lane_256_block2[13] = 64'h2573687FF364D517;
+        g_lane_256_block2[14] = 64'hE5E638FBA5A32142;
+        g_lane_256_block2[15] = 64'h80F50BC239CF4F2E;
+        g_lane_256_block2[16] = 64'h8F1E89D983EE2D2F;
+        g_lane_256_block2[17] = 64'hBFE2EAB3A6DEC312;
+        g_lane_256_block2[18] = 64'h0C342CE5BDE6111A;
+        g_lane_256_block2[19] = 64'h2A38BA62D281D2C7;
+        g_lane_256_block2[20] = 64'h0E88386CB3348EE5;
+        g_lane_256_block2[21] = 64'h75CA4C391523FE44;
+        g_lane_256_block2[22] = 64'h2F0F7368EE6C0DA2;
+        g_lane_256_block2[23] = 64'hF0D326F1AA0C9B88;
+        g_lane_256_block2[24] = 64'h211E0B7352E9ECCE;
+    end
+endtask
+
+task lanes256_to_words;
     integer i;
     begin
-        $display("---- test_sha3_256_200xa3 ----");
+        for (i = 0; i < 25; i = i + 1) begin
+            g_256_block2_word[2*i]   = g_lane_256_block2[i][31:0];
+            g_256_block2_word[2*i+1] = g_lane_256_block2[i][63:32];
+        end
+    end
+endtask
 
+task build_sha3_256_expected;
+    begin
         g_exp_256_word[0] = 32'hDE8AF379;
         g_exp_256_word[1] = 32'h0703C2C5;
         g_exp_256_word[2] = 32'h6EF78EA9;
@@ -413,35 +598,36 @@ task test_sha3_256_200xa3;
         g_exp_256_word[5] = 32'h73392EB2;
         g_exp_256_word[6] = 32'hBDA15FC6;
         g_exp_256_word[7] = 32'h8717E39D;
+    end
+endtask
 
-        do_clr_done;
-        do_clr_state;
-        set_mode(3'b001, 2'b00);
-        set_rounds(5'd23);
-        set_req_bytes(16'd32);
+task test_sha3_256_full_digest;
+    reg [31:0] rd;
+    integer i;
+    begin
+        $display("---- test_sha3_256_full_digest ----");
 
-        // Block1: 34 words x 4B = 136B (full rate -> auto flush)
-        for (i = 0; i < 34; i = i + 1)
-            write_msg_word(i[6:0], 32'hA3A3A3A3);
+        build_sha3_256_block2_lanes;
+        lanes256_to_words;
+        build_sha3_256_expected;
 
-        repeat (80) @(posedge r_HCLK);
+        clear_done;
+        clear_state;
 
-        // Block2: 16 words x 4B = 64B (partial -> sw_flush + padding)
-        for (i = 0; i < 16; i = i + 1)
-            write_msg_word(i[6:0], 32'hA3A3A3A3);
+        for (i = 0; i < 50; i = i + 1)
+            write_state_word(i[6:0], g_256_block2_word[i]);
 
-        do_sw_flush;
-
-        wait_absorb_done;
-        wait_squeeze_done;
+        set_rounds_minus1(5'd23);
+        start_core;
+        wait_done;
 
         for (i = 0; i < 8; i = i + 1) begin
-            read_state(i[6:0], rd);
+            read_state_word(i[6:0], rd);
             if (rd === g_exp_256_word[i]) begin
-                $display("PASS SHA3-256 word[%0d]: %08x", i, rd);
+                $display("PASS SHA3-256 full word[%0d]: %08x", i, rd);
                 r_passcnt = r_passcnt + 1;
             end else begin
-                $display("FAIL SHA3-256 word[%0d]: exp=%08x got=%08x",
+                $display("FAIL SHA3-256 full word[%0d]: exp=%08x got=%08x",
                          i, g_exp_256_word[i], rd);
                 r_failcnt = r_failcnt + 1;
             end
@@ -449,39 +635,49 @@ task test_sha3_256_200xa3;
     end
 endtask
 
-// ---------------------------------------------------------------
-// main
-// ---------------------------------------------------------------
+// -----------------------------
+// tb main
+// -----------------------------
 initial begin
-    $dumpfile("sha3_tb.vcd");
-    $dumpvars(0, tb_sha3);
+    $dumpfile("sha3_func_ahb_tb.vcd");
+    $dumpvars(0, sha3_func_ahb_tb);
 
-    r_passcnt = 0; r_failcnt = 0;
+    r_passcnt = 0;
+    r_failcnt = 0;
+
     r_HRESETn = 1'b0;
-    r_HSEL    = 1'b0; r_HADDR  = 32'h0; r_HTRANS = 2'b00;
-    r_HWRITE  = 1'b0; r_HSIZE  = 3'b010; r_HBURST = 3'b000;
-    r_HPROT   = 4'b0; r_HWDATA = 32'h0; r_HREADY = 1'b1;
+    r_HSEL    = 1'b0;
+    r_HADDR   = 32'h0000_0000;
+    r_HTRANS  = 2'b00;
+    r_HWRITE  = 1'b0;
+    r_HSIZE   = 3'b010;
+    r_HBURST  = 3'b000;
+    r_HPROT   = 4'b0000;
+    r_HWDATA  = 32'h0000_0000;
+    r_HREADY  = 1'b1;
 
     repeat (4) @(posedge r_HCLK);
     r_HRESETn = 1'b1;
     repeat (2) @(posedge r_HCLK);
 
     $display("==============================================");
-    $display("SHA3 TB start  (sha3_top)");
+    $display("SHA3 AHB TB start");
     $display("==============================================");
 
     test_reset_regs;
-    test_clr_state_smoke;
-    test_sha3_224_empty;
-    test_sha3_224_200xa3;
-    test_sha3_256_200xa3;
+    test_one_round_zero;
+    test_full_round_smoke;
+    test_sha3_224_round0_example;
+    test_sha3_224_full_digest;
+    test_sha3_256_full_digest;
 
     $display("==============================================");
     $display("PASS = %0d", r_passcnt);
     $display("FAIL = %0d", r_failcnt);
     $display("==============================================");
 
-    #20; $finish;
+    #20;
+    $finish;
 end
 
 endmodule
