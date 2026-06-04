@@ -373,10 +373,10 @@ endmodule
 
 // ------------------------------------------------------------
 // sha3_absorb_fifo
-// FIX1: w_sw_flush_go 조건에서 (r_byte_ptr > 0) 제거
-//       -> empty 메시지도 sw_flush 가능
-// FIX2: sw_flush 전용 pad 인스턴스 추가 (i_is_last=1 고정)
-//       -> sw_flush 시 올바른 패딩 삽입
+// FIX1: w_sw_flush_go condition removes (r_byte_ptr > 0) check
+//       -> empty message sw_flush is allowed
+// FIX2: dedicated pad instance for sw_flush (i_is_last=1 fixed)
+//       -> correct padding on sw_flush
 // ------------------------------------------------------------
 module sha3_absorb_fifo
 (
@@ -437,7 +437,7 @@ end
 
 wire [1343:0] w_fifo_merged = r_fifo | w_wr_data;
 
-// pad instance for normal write path (i_is_last = w_wr_last)
+// pad instance for normal write path
 wire [1343:0] w_pad_block;
 wire [7:0]    w_pad_rate_unused;
 wire [7:0]    w_pad_suf_unused;
